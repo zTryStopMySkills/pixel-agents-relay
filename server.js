@@ -110,7 +110,8 @@ wss.on('connection', (ws, req) => {
       const roomCode = randomCode(6);
       rooms.set(roomCode, {
         host: ws,
-        hostDisplayName: String(msg.displayName ?? 'Host'),
+        hostDisplayName: String(msg.displayName ?? 'Host').slice(0, 64),
+        workspaceFolder: msg.workspaceFolder ?? null,
         guests: new Map(),
         pending: new Map(),
         pendingCounter: 0,
@@ -130,17 +131,24 @@ wss.on('connection', (ws, req) => {
         ws.terminate();
         return;
       }
+      if (room.pending.size >= 10) {
+        send(ws, { type: 'joinRejected', reason: 'Too many pending requests' });
+        ws.terminate();
+        return;
+      }
       const requestId = `req_${++room.pendingCounter}`;
       const timer = setTimeout(() => {
         room.pending.delete(requestId);
+        socketRole.delete(ws);
         send(ws, { type: 'joinRejected', reason: 'Timeout' });
         ws.terminate();
         send(room.host, { type: 'joinRequestExpired', requestId });
       }, JOIN_TIMEOUT_MS);
 
-      room.pending.set(requestId, { ws, displayName: String(msg.displayName ?? 'Guest'), timer });
+      const displayName = String(msg.displayName ?? 'Guest').slice(0, 64);
+      room.pending.set(requestId, { ws, displayName, timer });
       socketRole.set(ws, { role: 'pending', roomCode: msg.roomCode });
-      send(room.host, { type: 'joinRequest', requestId, displayName: msg.displayName, remoteIp });
+      send(room.host, { type: 'joinRequest', requestId, displayName, remoteIp });
       console.log(`[Relay] Join request ${requestId} from ${msg.displayName} for room ${msg.roomCode}`);
       return;
     }
@@ -170,6 +178,7 @@ wss.on('connection', (ws, req) => {
         peerId,
         roomCode: role.roomCode,
         hostDisplayName: room.hostDisplayName,
+        workspaceFolder: room.workspaceFolder,
         peers: existingPeers,
         agents: [],
       });
@@ -208,6 +217,87 @@ wss.on('connection', (ws, req) => {
         broadcastGuests(room, { type: 'agentSnapshot', peerId: 'host', agents: msg.agents });
       } else if (role.role === 'guest') {
         broadcastRoom(room, { type: 'agentSnapshot', peerId: role.peerId, agents: msg.agents }, role.peerId);
+      }
+      return;
+    }
+
+    // ── layoutSync: host → specific guest only ───────────────────────────
+    if (msg.type === 'layoutSync' && role.role === 'host') {
+      const target = room.guests.get(msg.targetPeerId)?.ws;
+      if (target) send(target, { type: 'remoteLayoutSync', layout: msg.layout });
+      return;
+    }
+
+    // ── transcriptRequest: any peer → another peer ───────────────────────
+    if (msg.type === 'transcriptRequest') {
+      const targetPeerId = String(msg.targetPeerId ?? '');
+      let target = null;
+      if (targetPeerId === 'host') {
+        target = room.host;
+      } else {
+        target = room.guests.get(targetPeerId)?.ws ?? null;
+      }
+      if (target) {
+        send(target, { ...msg, fromPeerId: role.peerId ?? 'host' });
+      }
+      return;
+    }
+
+    // ── transcriptResponse: owner → requestor ────────────────────────────
+    if (msg.type === 'transcriptResponse') {
+      const targetPeerId = String(msg.targetPeerId ?? '');
+      let target = null;
+      if (targetPeerId === 'host') {
+        target = room.host;
+      } else {
+        target = room.guests.get(targetPeerId)?.ws ?? null;
+      }
+      if (target) send(target, msg);
+      return;
+    }
+
+    // ── annotationBroadcast: host only → all guests ───────────────────────
+    if (msg.type === 'annotationBroadcast' && role.role === 'host') {
+      broadcastGuests(room, msg);
+      return;
+    }
+
+    // ── chatMessage: public broadcast or private routing ─────────────────────
+    if (msg.type === 'chatMessage') {
+      const outMsg = {
+        type: 'chatMessage',
+        id: String(msg.id ?? ''),
+        fromPeerId: role.peerId ?? 'host',
+        fromName: String(msg.fromName ?? '').slice(0, 64),
+        text: String(msg.text ?? '').slice(0, 2000),
+        toPeerId: msg.toPeerId,
+        timestamp: typeof msg.timestamp === 'number' ? msg.timestamp : Date.now(),
+      };
+      if (msg.toPeerId) {
+        // Private: route to target only
+        const target = msg.toPeerId === 'host'
+          ? room.host
+          : room.guests.get(msg.toPeerId)?.ws ?? null;
+        if (target) send(target, outMsg);
+      } else {
+        // Public: broadcast to all except sender
+        broadcastRoom(room, outMsg, role.peerId ?? 'host');
+      }
+      return;
+    }
+
+    // ── kickPeer: host only → remove a guest ─────────────────────────────
+    if (msg.type === 'kickPeer' && role.role === 'host') {
+      const targetId = String(msg.peerId ?? '');
+      const target = room.guests.get(targetId);
+      if (target) {
+        const peerLeft = { type: 'peerLeft', peerId: targetId, reason: 'kicked' };
+        send(target.ws, peerLeft);
+        target.ws.terminate();
+        room.guests.delete(targetId);
+        // Notify remaining participants
+        broadcastRoom(room, peerLeft);
+        console.log(`[Relay] Guest ${targetId} kicked from room ${role.roomCode}`);
       }
       return;
     }
