@@ -93,7 +93,7 @@ const httpServer = createServer((_req, res) => {
   res.end('Pixel Agents Relay OK\n');
 });
 
-const wss = new WebSocketServer({ server: httpServer });
+const wss = new WebSocketServer({ server: httpServer, maxPayload: 10 * 1024 * 1024 /* 10 MB */ });
 
 wss.on('connection', (ws, req) => {
   const remoteIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
@@ -203,6 +203,20 @@ wss.on('connection', (ws, req) => {
 
     // ── agentEvent relay ─────────────────────────────────────────────────
     if (msg.type === 'agentEvent') {
+      const event = msg.event ?? {};
+      // Unicast: snapshot chunks/complete targeted at a specific peer
+      if (event.targetPeerId && (event.kind === 'workspaceSnapshotChunk' || event.kind === 'workspaceSnapshotComplete')) {
+        const targetWs = event.targetPeerId === 'host'
+          ? room.host
+          : room.guests.get(event.targetPeerId)?.ws ?? null;
+        if (targetWs) send(targetWs, { type: 'agentEvent', peerId: role.peerId ?? 'host', event });
+        return;
+      }
+      // Unicast: snapshot request goes to host only
+      if (event.kind === 'workspaceSnapshotRequest') {
+        send(room.host, { type: 'agentEvent', peerId: role.peerId ?? 'host', event });
+        return;
+      }
       if (role.role === 'host') {
         broadcastGuests(room, { type: 'agentEvent', peerId: 'host', event: msg.event });
       } else if (role.role === 'guest') {
@@ -299,6 +313,20 @@ wss.on('connection', (ws, req) => {
         broadcastRoom(room, peerLeft);
         console.log(`[Relay] Guest ${targetId} kicked from room ${role.roomCode}`);
       }
+      return;
+    }
+
+    // ── remoteExecRequest: guest → host ──────────────────────────────────
+    if (msg.type === 'remoteExecRequest' && role.role === 'guest') {
+      send(room.host, { ...msg, fromPeerId: role.peerId });
+      return;
+    }
+
+    // ── remoteExecResponse: host → specific guest ─────────────────────────
+    if (msg.type === 'remoteExecResponse' && role.role === 'host') {
+      const targetPeerId = String(msg.targetPeerId ?? '');
+      const target = room.guests.get(targetPeerId)?.ws ?? null;
+      if (target) send(target, msg);
       return;
     }
 
